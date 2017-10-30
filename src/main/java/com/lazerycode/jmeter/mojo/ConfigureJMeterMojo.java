@@ -37,6 +37,7 @@ import org.eclipse.aether.collection.CollectRequest;
 import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.DependencyFilter;
 import org.eclipse.aether.graph.DependencyNode;
+import org.eclipse.aether.graph.Exclusion;
 import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.resolution.ArtifactRequest;
 import org.eclipse.aether.resolution.ArtifactResolutionException;
@@ -414,7 +415,7 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 			}
 		}
 	}
-
+	
 	/**
 	 * Find a specific artifact in a remote repository
 	 *
@@ -441,11 +442,35 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 	 * @throws IOException
 	 */
 	private void copyTransitiveRuntimeDependenciesToLibDirectory(Artifact artifact, boolean getDependenciesOfDependency) throws DependencyResolutionException, IOException {
+		copyTransitiveRuntimeDependenciesToLibDirectory(new Dependency(artifact, JavaScopes.RUNTIME), getDependenciesOfDependency); 
+	}
+	
+	
+	/**
+	 * Same as {@link #copyTransitiveRuntimeDependenciesToLibDirectory(Artifact, boolean)} but with respect to dependency excludes
+	 * <p>
+	 * 
+	 * @param rootDependency
+	 * @param getDependenciesOfDependency
+	 * @throws DependencyResolutionException
+	 * @throws IOException
+	 */
+	private void copyTransitiveRuntimeDependenciesToLibDirectory(Dependency rootDependency, boolean getDependenciesOfDependency) throws DependencyResolutionException, IOException {
 		CollectRequest collectRequest = new CollectRequest();
-		collectRequest.setRoot(new Dependency(artifact, JavaScopes.RUNTIME));
+		collectRequest.setRoot(rootDependency);
 		collectRequest.setRepositories(repositoryList);
 		DependencyFilter dependencyFilter = DependencyFilterUtils.classpathFilter();
 		DependencyRequest dependencyRequest = new DependencyRequest(collectRequest, dependencyFilter);
+		
+		if (getLog().isDebugEnabled()) {
+			getLog().debug("Root dependency name: " + rootDependency.toString());
+			if ((dependencyRequest.getCollectRequest() != null) && (dependencyRequest.getCollectRequest().getTrace() != null)){
+				getLog().debug("Root dependency request trace: " + dependencyRequest.getCollectRequest().getTrace().toString());
+			}
+			getLog().debug("Root dependency exclusions: " + rootDependency.getExclusions());
+			getLog().debug("-------------------------------------------------------");
+		}
+		
 
 		try {
 			List<DependencyNode> artifactDependencyNodes = repositorySystem.resolveDependencies(repositorySystemSession, dependencyRequest).getRoot().getChildren();
@@ -455,21 +480,26 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 					getLog().debug("Dependency request trace: " + dependencyRequest.getCollectRequest().getTrace().toString());
 					getLog().debug("-------------------------------------------------------");
 				}
-				if (downloadOptionalDependencies || !dependencyNode.getDependency().isOptional()) {
+				Exclusion dummyExclusion = new Exclusion(dependencyNode.getArtifact().getGroupId(), dependencyNode.getArtifact().getArtifactId(), 
+						dependencyNode.getArtifact().getClassifier(), dependencyNode.getArtifact().getExtension());
+				if ((downloadOptionalDependencies || !dependencyNode.getDependency().isOptional()) ||
+						!((rootDependency.getExclusions() != null) && (rootDependency.getExclusions().contains(dummyExclusion)) ) ) {
 					Artifact returnedArtifact = getArtifactResult(dependencyNode.getArtifact());
 					if (!returnedArtifact.getArtifactId().startsWith("ApacheJMeter_")) {
 						copyArtifact(returnedArtifact, libDirectory);
 					}
 
 					if (getDependenciesOfDependency) {
-						copyTransitiveRuntimeDependenciesToLibDirectory(returnedArtifact, true);
+						copyTransitiveRuntimeDependenciesToLibDirectory(dependencyNode.getDependency(), true);
 					}
 				}
 			}
 		} catch (org.eclipse.aether.resolution.DependencyResolutionException e) {
 			throw new DependencyResolutionException(e.getMessage(), e);
 		}
+		
 	}
+	
 
 	/**
 	 * Copy an Artifact to a directory
