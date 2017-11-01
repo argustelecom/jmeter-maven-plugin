@@ -13,10 +13,13 @@ import static org.apache.commons.io.FileUtils.copyInputStreamToFile;
 import java.io.File;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -34,17 +37,27 @@ import org.eclipse.aether.RepositorySystemSession;
 import org.eclipse.aether.artifact.Artifact;
 import org.eclipse.aether.artifact.DefaultArtifact;
 import org.eclipse.aether.collection.CollectRequest;
+import org.eclipse.aether.collection.DependencyCollectionException;
 import org.eclipse.aether.graph.Dependency;
 import org.eclipse.aether.graph.DependencyFilter;
 import org.eclipse.aether.graph.DependencyNode;
 import org.eclipse.aether.graph.Exclusion;
 import org.eclipse.aether.repository.RemoteRepository;
+import org.eclipse.aether.resolution.ArtifactDescriptorException;
+import org.eclipse.aether.resolution.ArtifactDescriptorRequest;
+import org.eclipse.aether.resolution.ArtifactDescriptorResult;
 import org.eclipse.aether.resolution.ArtifactRequest;
 import org.eclipse.aether.resolution.ArtifactResolutionException;
+import org.eclipse.aether.resolution.ArtifactResult;
 import org.eclipse.aether.resolution.DependencyRequest;
 import org.eclipse.aether.util.artifact.JavaScopes;
 import org.eclipse.aether.util.filter.DependencyFilterUtils;
+import org.eclipse.aether.util.version.GenericVersionScheme;
+import org.eclipse.aether.version.InvalidVersionSpecificationException;
+import org.eclipse.aether.version.Version;
 
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.lazerycode.jmeter.exceptions.DependencyResolutionException;
 import com.lazerycode.jmeter.exceptions.IOException;
 import com.lazerycode.jmeter.json.TestConfig;
@@ -408,13 +421,56 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 	 */
 	private void copyExplicitLibraries(List<String> desiredArtifacts, File destination, boolean downloadDependencies) throws DependencyResolutionException, IOException {
 		for (String desiredArtifact : desiredArtifacts) {
-			Artifact returnedArtifact = getArtifactResult(new DefaultArtifact(desiredArtifact));
-			copyArtifact(returnedArtifact, destination);
-			if (downloadDependencies) {
-				copyTransitiveRuntimeDependenciesToLibDirectory(returnedArtifact, true);
-			}
+			copyExplicitLibraries(desiredArtifact, destination, downloadDependencies);
 		}
 	}
+	
+	private void copyExplicitLibraries(String desiredArtifact, File destination, boolean downloadDependencies) throws DependencyResolutionException, IOException {
+		Artifact returnedArtifact = getArtifactResult(new DefaultArtifact(desiredArtifact));
+		copyArtifact(returnedArtifact, destination);
+		if (downloadDependencies) {
+			//copyTransitiveRuntimeDependenciesToLibDirectory(returnedArtifact, true);
+			resolveTestDepsAndCopyWithTransitivity(returnedArtifact, true);
+		}
+		// Помним, что наши -ui-tests проекты зависят от ui-проектов(в реальности у тестов в момент выполнения на classpath есть весь src/main/), 
+		// но эта зависимость неявная, в pom`е не описана. Чтобы в конфигурации плагина не указывать проекты дважды, подсуетимся здесь. 
+		// Также, x-ui-проект обычно зависит от x-проекта. Эта зависимость вынесена в профили, которые активируются по наличию файлов в ФС.
+		// Ессно наш плагин такое не заметит. Итого, на каждый -ui-tests проект надо вспомнить еще как минимум про два. Например, для rms-ui-tests
+		// нужно еще процессить rms-ui и rms.
+		if(returnedArtifact.getGroupId().startsWith("ru.argustelecom.") && returnedArtifact.getArtifactId().endsWith("-ui")){
+			// Ожидаемый формат  <groupId>:<artifactId>[:<extension>[:<classifier>]]:<version>. @see DefaultArtifact( String coords )
+			String coordinates = "";
+			if (returnedArtifact.getClassifier().equals("tests")){
+				coordinates = returnedArtifact.getGroupId() + ":" +  returnedArtifact.getArtifactId() + ":" + returnedArtifact.getVersion();
+			} else {
+				String artifactId = returnedArtifact.getArtifactId().substring(0, returnedArtifact.getArtifactId().length() - "-ui".length());
+				coordinates = returnedArtifact.getGroupId() + ":" + artifactId + (Strings.isNullOrEmpty(returnedArtifact.getClassifier()) ? ""
+								: ":" + returnedArtifact.getExtension() + ":" + returnedArtifact.getClassifier()) + ":" + returnedArtifact.getVersion();
+			}
+			copyExplicitLibraries(coordinates, destination, downloadDependencies);
+		}
+		
+		
+	}
+	
+	/**
+	 * Dependency graph can contain circular references. For example: dom4j:dom4j:jar:1.5.2 and jaxen:jaxen:jar:1.1-beta-4
+	 * To prevent endless loop and stack overflow, save processed artifacts and check not processed previously before processing.
+	 * <p>
+	 * May be better to use {@link Artifact}, but {@link AbstractArtifact#equals} unreliably depends on local file path. So using {@link Exclusion} items
+	 * <p> 
+	 */
+	private Set<Exclusion> processedArtifacts = new HashSet<Exclusion> (); 
+	
+	/**
+	 * После наших переделок в каталоге lib множество артефактов с одинаковым groupid, classifier и artifactId, но разными версиями.
+	 * Ессно, это все портит, так как дубли на classpath при открытии jmeter. Причина, скорее всего, в  том, что резолвим артефакты поштучно
+	 * в copyTransitiveRuntimeDependenciesToLibDirectory. Будем исключать дубли в последний момент, на этапе копирования. #TODO: криво
+	 * <p>
+	 * 
+	 */
+	private Set<Artifact> copiedArtifacts = new HashSet<Artifact> ();
+
 	
 	/**
 	 * Find a specific artifact in a remote repository
@@ -433,6 +489,28 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 			throw new DependencyResolutionException(e.getMessage(), e);
 		}
 	}
+	
+	
+	private void resolveTestDepsAndCopyWithTransitivity(Artifact artifact, boolean getDependenciesOfDependency) throws DependencyResolutionException, IOException {
+		ArtifactDescriptorRequest request = new ArtifactDescriptorRequest(artifact, repositoryList, null);
+		try {
+			ArtifactDescriptorResult result = repositorySystem.readArtifactDescriptor(repositorySystemSession, request);
+			for (Dependency dep: result.getDependencies()){
+				// Здесь не можем отсеивать зависимости по scope. 
+				// нужно использовать зависимости с любым scope, так как для выполнения тестов нужны и test, и provided и тем более compile-scoped зависимости  
+				if( true /*(dep.getScope().equals(JavaScopes.TEST)) || (dep.getScope().equals(JavaScopes.COMPILE))*/){
+					ArtifactResult artifactResult = repositorySystem.resolveArtifact(repositorySystemSession, new ArtifactRequest(dep.getArtifact(), repositoryList, null));
+					if(isLibraryArtifact(artifactResult.getArtifact())){
+						copyArtifact(artifactResult.getArtifact(), libDirectory);
+					}
+					copyTransitiveRuntimeDependenciesToLibDirectory(dep, getDependenciesOfDependency);
+				}
+			}
+		} catch (ArtifactDescriptorException | ArtifactResolutionException e) {
+			e.printStackTrace();
+			throw new DependencyResolutionException(e.getMessage(), e);
+		}	
+	}
 
 	/**
 	 * Collate a list of transitive runtime dependencies that need to be copied to the /lib directory and then copy them there.
@@ -442,7 +520,7 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 	 * @throws IOException
 	 */
 	private void copyTransitiveRuntimeDependenciesToLibDirectory(Artifact artifact, boolean getDependenciesOfDependency) throws DependencyResolutionException, IOException {
-		copyTransitiveRuntimeDependenciesToLibDirectory(new Dependency(artifact, JavaScopes.RUNTIME), getDependenciesOfDependency); 
+		copyTransitiveRuntimeDependenciesToLibDirectory(new Dependency(artifact, JavaScopes.TEST), getDependenciesOfDependency); 
 	}
 	
 	
@@ -459,7 +537,9 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 		CollectRequest collectRequest = new CollectRequest();
 		collectRequest.setRoot(rootDependency);
 		collectRequest.setRepositories(repositoryList);
-		DependencyFilter dependencyFilter = DependencyFilterUtils.classpathFilter();
+		// в #classpathFilter передаем на самом деле не scope, а идентификатор classpath(просто используется тот же enum, что и для scope`ов).
+		//То есть, например, для тестового classpath нужны зависимости с любым scope (то есть фильтр по TEST наиболее мягкий)
+		DependencyFilter dependencyFilter = DependencyFilterUtils.classpathFilter(JavaScopes.TEST);
 		DependencyRequest dependencyRequest = new DependencyRequest(collectRequest, dependencyFilter);
 		
 		if (getLog().isDebugEnabled()) {
@@ -470,34 +550,75 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 			getLog().debug("Root dependency exclusions: " + rootDependency.getExclusions());
 			getLog().debug("-------------------------------------------------------");
 		}
-		
 
 		try {
-			List<DependencyNode> artifactDependencyNodes = repositorySystem.resolveDependencies(repositorySystemSession, dependencyRequest).getRoot().getChildren();
+			// здесь не можем резолвить, так как могут попасться exclusions, которые потому и excluded, что отсутствуют в репозиториях.
+			//List<DependencyNode> artifactDependencyNodes = repositorySystem.resolveDependencies(repositorySystemSession, dependencyRequest).getRoot().getChildren();
+			List<DependencyNode> artifactDependencyNodes = repositorySystem.collectDependencies(repositorySystemSession, collectRequest).getRoot().getChildren();
 			for (DependencyNode dependencyNode : artifactDependencyNodes) {
 				if (getLog().isDebugEnabled()) {
 					getLog().debug("Dependency name: " + dependencyNode.toString());
-					getLog().debug("Dependency request trace: " + dependencyRequest.getCollectRequest().getTrace().toString());
 					getLog().debug("-------------------------------------------------------");
 				}
 				Exclusion dummyExclusion = new Exclusion(dependencyNode.getArtifact().getGroupId(), dependencyNode.getArtifact().getArtifactId(), 
 						dependencyNode.getArtifact().getClassifier(), dependencyNode.getArtifact().getExtension());
-				if ((downloadOptionalDependencies || !dependencyNode.getDependency().isOptional()) ||
-						!((rootDependency.getExclusions() != null) && (rootDependency.getExclusions().contains(dummyExclusion)) ) ) {
-					Artifact returnedArtifact = getArtifactResult(dependencyNode.getArtifact());
-					if (!returnedArtifact.getArtifactId().startsWith("ApacheJMeter_")) {
+				if ((downloadOptionalDependencies || !dependencyNode.getDependency().isOptional()) &&
+						!((rootDependency.getExclusions() != null) && (containsEx(rootDependency.getExclusions(), dummyExclusion)) ) ) {
+					//Artifact returnedArtifact = getArtifactResult(dependencyNode.getArtifact());
+					Artifact returnedArtifact = repositorySystem.resolveArtifact(repositorySystemSession, new ArtifactRequest(dependencyNode)).getArtifact();
+					if ((!returnedArtifact.getArtifactId().startsWith("ApacheJMeter_")) && (isLibraryArtifact(returnedArtifact))){
 						copyArtifact(returnedArtifact, libDirectory);
 					}
 
-					if (getDependenciesOfDependency) {
+					if (getDependenciesOfDependency && !processedArtifacts.contains(dummyExclusion)) {
+						processedArtifacts.add(dummyExclusion);
+						if (getLog().isDebugEnabled()) {
+							getLog().debug("Added to processed list: " + dummyExclusion);
+							getLog().debug("total processed: " + processedArtifacts.size());
+							getLog().debug("-------------------------------------------------------");
+						}
 						copyTransitiveRuntimeDependenciesToLibDirectory(dependencyNode.getDependency(), true);
+						
+						
 					}
 				}
 			}
-		} catch (org.eclipse.aether.resolution.DependencyResolutionException e) {
+		} catch (DependencyCollectionException | ArtifactResolutionException e) {
 			throw new DependencyResolutionException(e.getMessage(), e);
 		}
 		
+	}
+	
+	/**
+	 * Эксклюд может быть указан wildcard`ом:
+	 * -- groupId:artifactId:*:*
+	 * -- groupId:*:*:*
+	 * <p>
+	 * Да и вообще, требовать строгого совпадения вплоть до версии и classifier не нужно
+	 * <p>
+	 * #TODO: правильныее было бы переписать {@link Exclusion#equals(Object)}, но как быть с граничным случаем: 
+	 * Если  contains(id1:*:*:*, id1:id2:*:*)==true, то вот equals??    
+	 * #TODO: наверняка есть утилитарный код в Aether или мавене на эту тему
+	 * <p>
+	 * @param exclusions
+	 * @param exclusion
+	 * @return
+	 */
+	private boolean containsEx(Collection<Exclusion> exclusions, Exclusion exclusion){
+		Preconditions.checkState(exclusions != null);
+		Preconditions.checkState(exclusion != null);
+		for(Exclusion x: exclusions){
+			if (x.getGroupId().equals(exclusion.getGroupId())){
+				if( (x.getArtifactId().equals(exclusion.getArtifactId())) || (x.getArtifactId().equals("*"))){
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	
+	private boolean isLibraryArtifact(Artifact artifact){
+		return artifact.getExtension().equals("jar") || artifact.getExtension().equals("war") || artifact.getExtension().equals("zip") || artifact.getExtension().equals("ear");		
 	}
 	
 
@@ -518,13 +639,37 @@ public class ConfigureJMeterMojo extends AbstractJMeterMojo {
 			}
 		}
 		try {
+			for (Artifact x: copiedArtifacts){
+				if(x.getGroupId().equals(artifact.getGroupId()) && 
+						x.getArtifactId().equals(artifact.getArtifactId()) && 
+						x.getExtension().equals(artifact.getExtension()) && 
+						x.getClassifier().equals(artifact.getClassifier())){
+					// уже копировали, но возможно, щас версия более свежая, чем была. Нужно оставить того, который свежее
+					GenericVersionScheme genericVersionScheme = new GenericVersionScheme();
+					Version xVersion = genericVersionScheme.parseVersion(x.getVersion()); 					
+					Version artifactVersion = genericVersionScheme.parseVersion(artifact.getVersion());
+					if (xVersion.compareTo(artifactVersion) >= 0){
+						// версия уже скопированного артефакта выше либо такая же, копировать не надо, ничего не делаем
+						return;
+					} else{
+						// старый артефакт удаляем, а новый копируем 
+						// (здесь только удаляем, копировать будем по выходу из цикла)
+						File artifactToDelete = new File(destinationDirectory + File.separator + x.getFile().getName());
+						FileUtils.forceDelete(artifactToDelete);
+						copiedArtifacts.remove(x);
+						break;
+					}
+				}
+			}
+			copiedArtifacts.add(artifact);
+			
 			File artifactToCopy = new File(destinationDirectory + File.separator + artifact.getFile().getName());
 			getLog().debug("Checking: " + artifactToCopy.getAbsolutePath() + "...");
 			if (!artifactToCopy.exists()) {
 				getLog().debug("Copying: " + artifactToCopy.getAbsolutePath() + "...");
 				FileUtils.copyFileToDirectory(artifact.getFile(), destinationDirectory);
 			}
-		} catch (java.io.IOException e) {
+		} catch (java.io.IOException | InvalidVersionSpecificationException e) {
 			throw new IOException(e.getMessage(), e);
 		}
 	}
